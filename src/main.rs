@@ -54,32 +54,370 @@ fn reservation_owner(cars:&[Vehicle])->Option<u64> {
     cars.iter().find(|v|v.phase==Phase::Crossing).map(|v|v.id).or_else(||cars.iter().filter(|v|v.phase==Phase::Queue && v.p>=STOP_LINE).map(|v|v.id).min())
 }
 fn should_wait_for_reservation(owner:Option<u64>,vehicle_id:u64,progress:f32)->bool { owner.is_some() && owner!=Some(vehicle_id) && progress>=STOP_LINE }
-fn draw_car(canvas:&mut sdl2::render::Canvas<sdl2::video::Window>,v:&Vehicle) {
-    let (x,y)=position(v); let (dx,dy)=v.from.heading(); let mut angle=dy.atan2(dx);
-    if v.phase==Phase::Crossing && v.turn!=Turn::Straight {
-        let (tx,ty)=v.from.turn_heading(v.turn); let target=ty.atan2(tx);
-        let delta=(target-angle+std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)-std::f32::consts::PI;
-        angle+=delta*v.p.clamp(0.,1.);
+type Cv = sdl2::render::Canvas<sdl2::video::Window>;
+
+fn shade(c: Color, f: f32) -> Color {
+    let m = |v: u8| ((v as f32) * f).clamp(0., 255.) as u8;
+    Color::RGB(m(c.r), m(c.g), m(c.b))
+}
+
+/// Scanline polygon fill (works with alpha because every pixel is drawn once).
+fn fill_poly(canvas: &mut Cv, pts: &[(f32, f32)]) {
+    let n = pts.len();
+    if n < 3 { return; }
+    let min_y = pts.iter().map(|p| p.1).fold(f32::INFINITY, f32::min).floor() as i32;
+    let max_y = pts.iter().map(|p| p.1).fold(f32::NEG_INFINITY, f32::max).ceil() as i32;
+    let mut hits: Vec<f32> = Vec::with_capacity(n);
+    for row in min_y..=max_y {
+        let ry = row as f32 + 0.5;
+        hits.clear();
+        for i in 0..n {
+            let a = pts[i];
+            let b = pts[(i + 1) % n];
+            if (a.1 <= ry && b.1 > ry) || (b.1 <= ry && a.1 > ry) {
+                let t = (ry - a.1) / (b.1 - a.1);
+                hits.push(a.0 + t * (b.0 - a.0));
+            }
+        }
+        hits.sort_by(f32::total_cmp);
+        let mut k = 0;
+        while k + 1 < hits.len() {
+            let _ = canvas.draw_line((hits[k].round() as i32, row), (hits[k + 1].round() as i32, row));
+            k += 2;
+        }
     }
-    let (sin,cos)=angle.sin_cos(); let fx=cos*15.;let fy=sin*15.;let sx=-sin*8.;let sy=cos*8.;
-    let corners=[(x+fx+sx,y+fy+sy),(x+fx-sx,y+fy-sy),(x-fx-sx,y-fy-sy),(x-fx+sx,y-fy+sy)];
-    let min_y=corners.iter().map(|p|p.1).fold(f32::INFINITY,f32::min).floor() as i32;
-    let max_y=corners.iter().map(|p|p.1).fold(f32::NEG_INFINITY,f32::max).ceil() as i32;
+}
+
+fn fill_circle(canvas: &mut Cv, cx: i32, cy: i32, r: i32, color: Color) {
+    canvas.set_draw_color(color);
+    for dy in -r..=r {
+        let w = ((r * r - dy * dy) as f32).sqrt() as i32;
+        let _ = canvas.fill_rect(Rect::new(cx - w, cy + dy, (2 * w + 1) as u32, 1));
+    }
+}
+
+fn thick_line(canvas: &mut Cv, a: (f32, f32), b: (f32, f32), w: f32) {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let len = (dx * dx + dy * dy).sqrt().max(0.001);
+    let (nx, ny) = (-dy / len * w * 0.5, dx / len * w * 0.5);
+    fill_poly(canvas, &[(a.0 + nx, a.1 + ny), (b.0 + nx, b.1 + ny), (b.0 - nx, b.1 - ny), (a.0 - nx, a.1 - ny)]);
+}
+
+fn pose(v: &Vehicle) -> (f32, f32, f32) {
+    let (x, y) = position(v);
+    let (dx, dy) = v.from.heading();
+    let mut angle = dy.atan2(dx);
+    if v.phase == Phase::Crossing && v.turn != Turn::Straight {
+        let (tx, ty) = v.from.turn_heading(v.turn);
+        let target = ty.atan2(tx);
+        let delta = (target - angle + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
+        angle += delta * v.p.clamp(0., 1.);
+    }
+    (x, y, angle)
+}
+
+/// Car-local coordinates: `u` runs along the heading, `w` across the car.
+fn local_frame(x: f32, y: f32, angle: f32) -> impl Fn(f32, f32) -> (f32, f32) {
+    let (sin, cos) = angle.sin_cos();
+    move |u, w| (x + cos * u - sin * w, y + sin * u + cos * w)
+}
+
+/// Pass 1: things that lie on the road under every car (headlight beams, brake glow, shadow).
+fn draw_car_under(canvas: &mut Cv, v: &Vehicle) {
+    let (x, y, ang) = pose(v);
+    let pt = local_frame(x, y, ang);
+    canvas.set_draw_color(Color::RGBA(255, 240, 190, 18));
+    fill_poly(canvas, &[pt(14., -6.), pt(14., 6.), pt(58., 18.), pt(58., -18.)]);
+    canvas.set_draw_color(Color::RGBA(255, 240, 190, 22));
+    fill_poly(canvas, &[pt(14., -5.), pt(14., 5.), pt(34., 9.), pt(34., -9.)]);
+    if v.speed < 0.5 {
+        canvas.set_draw_color(Color::RGBA(255, 60, 50, 34));
+        fill_poly(canvas, &[pt(-15., -6.), pt(-15., 6.), pt(-27., 10.), pt(-27., -10.)]);
+    }
+    let sh = |u: f32, w: f32| { let p = pt(u, w); (p.0 + 3., p.1 + 4.) };
+    canvas.set_draw_color(Color::RGBA(0, 0, 0, 90));
+    fill_poly(canvas, &[sh(15., -8.), sh(15., 8.), sh(-15., 8.), sh(-15., -8.)]);
+}
+
+/// Pass 2: the car itself.
+fn draw_car(canvas: &mut Cv, v: &Vehicle) {
+    let (x, y, ang) = pose(v);
+    let pt = local_frame(x, y, ang);
+    let stopped = v.speed < 0.5;
+
+    let body = [pt(-15., -6.), pt(-13., -8.), pt(12., -8.), pt(15., -5.), pt(15., 5.), pt(12., 8.), pt(-13., 8.), pt(-15., 6.)];
     canvas.set_draw_color(v.color);
-    for row in min_y..=max_y { let mut hits=Vec::new(); for i in 0..4 {let a=corners[i];let b=corners[(i+1)%4];if (a.1<=row as f32 && b.1>row as f32)||(b.1<=row as f32 && a.1>row as f32){let t=(row as f32-a.1)/(b.1-a.1);hits.push(a.0+t*(b.0-a.0));}} if hits.len()>=2 {hits.sort_by(f32::total_cmp);let _=canvas.draw_line((hits[0] as i32,row),(hits[hits.len()-1] as i32,row));}}
-    canvas.set_draw_color(Color::RGB(22,27,30));for i in 0..4 {let a=corners[i];let b=corners[(i+1)%4];let _=canvas.draw_line((a.0 as i32,a.1 as i32),(b.0 as i32,b.1 as i32));}
+    fill_poly(canvas, &body);
+    canvas.set_draw_color(shade(v.color, 0.55));
+    for i in 0..body.len() {
+        let a = body[i];
+        let b = body[(i + 1) % body.len()];
+        let _ = canvas.draw_line((a.0.round() as i32, a.1.round() as i32), (b.0.round() as i32, b.1.round() as i32));
+    }
+
+    // glass, then a lighter roof on top of it
+    canvas.set_draw_color(Color::RGB(30, 42, 56));
+    fill_poly(canvas, &[pt(10., -5.5), pt(10., 5.5), pt(-9., 6.), pt(-9., -6.)]);
+    canvas.set_draw_color(Color::RGBA(170, 205, 230, 80));
+    fill_poly(canvas, &[pt(9., -4.5), pt(9., -1.5), pt(6., -1.5), pt(6., -4.5)]);
+    canvas.set_draw_color(shade(v.color, 1.15));
+    fill_poly(canvas, &[pt(4., -5.), pt(4., 5.), pt(-6., 5.5), pt(-6., -5.5)]);
+
+    // headlights and tail lights (brake lights are brighter while stopped)
+    let tail = if stopped { Color::RGB(255, 64, 52) } else { Color::RGB(150, 34, 34) };
+    for s in [-1., 1.] {
+        canvas.set_draw_color(Color::RGB(255, 238, 176));
+        fill_poly(canvas, &[pt(12., s * 3.), pt(15., s * 3.), pt(15., s * 5.), pt(12., s * 6.)]);
+        canvas.set_draw_color(tail);
+        fill_poly(canvas, &[pt(-15., s * 3.), pt(-12., s * 3.), pt(-12., s * 6.), pt(-15., s * 5.)]);
+    }
+
+    // blinking turn signal on the side of the planned turn
+    let side = match v.turn { Turn::Left => Some(-1.), Turn::Right => Some(1.), Turn::Straight => None };
+    let visible = match v.phase { Phase::Queue => v.p > 40., Phase::Crossing => v.p < 0.55 };
+    let blink_on = ((v.elapsed * 3.) as i32) % 2 == 0;
+    if let Some(s) = side {
+        if visible && blink_on {
+            canvas.set_draw_color(Color::RGB(255, 176, 32));
+            for u in [13., -13.] {
+                fill_poly(canvas, &[pt(u - 1.5, s * 5.5), pt(u + 1.5, s * 5.5), pt(u + 1.5, s * 8.5), pt(u - 1.5, s * 8.5)]);
+            }
+        }
+    }
+}
+
+fn draw_scene(c: &mut Cv) {
+    // lawn with mown stripes (only the four corners are visible)
+    c.set_draw_color(Color::RGB(40, 78, 58));
+    c.clear();
+    c.set_draw_color(Color::RGB(45, 87, 64));
+    for ty in 0..25i32 {
+        for tx in 0..25i32 {
+            if (tx + ty) % 2 == 0 && (tx < 9 || tx >= 16) && (ty < 9 || ty >= 16) {
+                let _ = c.fill_rect(Rect::new(tx * 32, ty * 32, 32, 32));
+            }
+        }
+    }
+
+    // trees seen from above: shadow, dark crown, lighter layers, highlight
+    let trees: [(i32, i32, i32); 24] = [
+        (52, 58, 22), (150, 38, 15), (238, 82, 13), (38, 172, 15), (130, 150, 23), (222, 236, 16),
+        (748, 66, 20), (640, 44, 16), (560, 110, 14), (764, 190, 14), (662, 160, 21), (580, 246, 15),
+        (56, 744, 19), (160, 764, 14), (246, 700, 15), (36, 620, 13), (128, 650, 22), (224, 568, 17),
+        (744, 736, 21), (650, 758, 15), (566, 704, 14), (766, 604, 15), (668, 640, 23), (580, 574, 16),
+    ];
+    for &(x, y, r) in trees.iter() {
+        fill_circle(c, x + 4, y + 6, r, Color::RGBA(0, 0, 0, 60));
+        fill_circle(c, x, y, r, Color::RGB(27, 66, 46));
+        fill_circle(c, x - r / 8, y - r / 8, r * 3 / 4, Color::RGB(36, 88, 58));
+        fill_circle(c, x - r / 4, y - r / 4, r / 2, Color::RGB(54, 116, 74));
+        fill_circle(c, x - r / 3, y - r / 3, (r / 5).max(2), Color::RGB(88, 150, 98));
+    }
+
+    // sidewalks with paving joints and curbs
+    c.set_draw_color(Color::RGB(166, 166, 158));
+    let _ = c.fill_rect(Rect::new(288, 0, 224, 800));
+    let _ = c.fill_rect(Rect::new(0, 288, 800, 224));
+    c.set_draw_color(Color::RGB(142, 144, 138));
+    for i in (0..800).step_by(24) {
+        let _ = c.draw_line((288, i), (299, i));
+        let _ = c.draw_line((500, i), (511, i));
+        let _ = c.draw_line((i, 288), (i, 299));
+        let _ = c.draw_line((i, 500), (i, 511));
+    }
+    for &(a, b) in [(0, 288), (512, 800)].iter() {
+        c.set_draw_color(Color::RGB(208, 208, 200));
+        let _ = c.draw_line((288, a), (288, b));
+        let _ = c.draw_line((511, a), (511, b));
+        let _ = c.draw_line((a, 288), (b, 288));
+        let _ = c.draw_line((a, 511), (b, 511));
+        c.set_draw_color(Color::RGB(78, 82, 84));
+        let _ = c.draw_line((299, a), (299, b));
+        let _ = c.draw_line((500, a), (500, b));
+        let _ = c.draw_line((a, 299), (b, 299));
+        let _ = c.draw_line((a, 500), (b, 500));
+    }
+
+    // asphalt with a little grain
+    c.set_draw_color(Color::RGB(43, 49, 55));
+    let _ = c.fill_rect(Rect::new(300, 0, 200, 800));
+    let _ = c.fill_rect(Rect::new(0, 300, 800, 200));
+    c.set_draw_color(Color::RGB(47, 53, 59));
+    let _ = c.fill_rect(Rect::new(300, 300, 200, 200));
+    let mut s: u64 = 0x2545F4914F6CDD1D;
+    for i in 0..500 {
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let x = ((s >> 33) % 800) as i32;
+        let y = ((s >> 13) % 800) as i32;
+        if (300..500).contains(&x) || (300..500).contains(&y) {
+            c.set_draw_color(if i % 2 == 0 { Color::RGB(58, 64, 70) } else { Color::RGB(34, 39, 44) });
+            let _ = c.fill_rect(Rect::new(x, y, 2, 1));
+        }
+    }
+
+    // median strip with double yellow lines
+    let median: [(i32, i32, u32, u32); 4] = [(391, 0, 18, 300), (391, 500, 18, 300), (0, 391, 300, 18), (500, 391, 300, 18)];
+    c.set_draw_color(Color::RGB(54, 60, 66));
+    for &(x, y, w, h) in median.iter() { let _ = c.fill_rect(Rect::new(x, y, w, h)); }
+    let yellow: [(i32, i32, u32, u32); 8] = [
+        (389, 0, 2, 300), (409, 0, 2, 300), (389, 500, 2, 300), (409, 500, 2, 300),
+        (0, 389, 300, 2), (0, 409, 300, 2), (500, 389, 300, 2), (500, 409, 300, 2),
+    ];
+    c.set_draw_color(Color::RGB(236, 190, 64));
+    for &(x, y, w, h) in yellow.iter() { let _ = c.fill_rect(Rect::new(x, y, w, h)); }
+
+    // dashed white lane dividers
+    c.set_draw_color(Color::RGB(204, 208, 206));
+    for a in (0..300).step_by(40).chain((500..800).step_by(40)) {
+        for &b in [329, 359, 439, 469].iter() {
+            let _ = c.fill_rect(Rect::new(b, a, 2, 20));
+            let _ = c.fill_rect(Rect::new(a, b, 20, 2));
+        }
+    }
+
+    // stop lines
+    c.set_draw_color(Color::RGB(228, 230, 226));
+    let _ = c.fill_rect(Rect::new(301, 287, 88, 4));
+    let _ = c.fill_rect(Rect::new(411, 509, 88, 4));
+    let _ = c.fill_rect(Rect::new(287, 411, 4, 88));
+    let _ = c.fill_rect(Rect::new(509, 301, 4, 88));
+
+    // painted lane arrows (left / straight / right) for every approach
+    c.set_draw_color(Color::RGB(138, 144, 146));
+    for &ap in [Approach::North, Approach::East, Approach::South, Approach::West].iter() {
+        for &t in [Turn::Left, Turn::Straight, Turn::Right].iter() {
+            let (hx, hy) = ap.heading();
+            let (dx, dy) = ap.turn_heading(t);
+            let st = ap.start(t);
+            let p = (st.0 + hx * 190., st.1 + hy * 190.);
+            let tail = (p.0 - hx * 14., p.1 - hy * 14.);
+            let q = (p.0 + dx * 6., p.1 + dy * 6.);
+            let tip = (p.0 + dx * 12., p.1 + dy * 12.);
+            let (nx, ny) = (-dy * 5., dx * 5.);
+            thick_line(c, tail, p, 3.);
+            thick_line(c, p, q, 3.);
+            fill_poly(c, &[tip, (q.0 + nx, q.1 + ny), (q.0 - nx, q.1 - ny)]);
+        }
+    }
+
+    // zebra crossings
+    c.set_draw_color(Color::RGB(214, 216, 208));
+    for i in 0..10 {
+        let p = 305 + i * 20;
+        let _ = c.fill_rect(Rect::new(p, 303, 10, 14));
+        let _ = c.fill_rect(Rect::new(p, 483, 10, 14));
+    }
+    for i in 0..8 {
+        let p = 325 + i * 20;
+        let _ = c.fill_rect(Rect::new(303, p, 14, 10));
+        let _ = c.fill_rect(Rect::new(483, p, 14, 10));
+    }
+}
+
+fn draw_vignette(c: &mut Cv) {
+    for i in 0..28i32 {
+        let a = (70. - i as f32 * 2.4).max(0.) as u8;
+        c.set_draw_color(Color::RGBA(0, 0, 0, a));
+        let _ = c.draw_rect(Rect::new(i, i, (800 - 2 * i) as u32, (800 - 2 * i) as u32));
+    }
+}
+fn glyph_rows(c:char)->[u8;5] { match c.to_ascii_uppercase() {
+    'A'=>[2,5,7,5,5],'B'=>[6,5,6,5,6],'C'=>[3,4,4,4,3],'D'=>[6,5,5,5,6],'E'=>[7,4,6,4,7],'F'=>[7,4,6,4,4],
+    'G'=>[3,4,5,5,3],'H'=>[5,5,7,5,5],'I'=>[7,2,2,2,7],'J'=>[1,1,1,5,2],'K'=>[5,5,6,5,5],'L'=>[4,4,4,4,7],
+    'M'=>[5,7,7,5,5],'N'=>[5,7,7,7,5],'O'=>[2,5,5,5,2],'P'=>[6,5,6,4,4],'Q'=>[2,5,5,7,3],'R'=>[6,5,6,5,5],
+    'S'=>[3,4,2,1,6],'T'=>[7,2,2,2,2],'U'=>[5,5,5,5,7],'V'=>[5,5,5,5,2],'W'=>[5,5,7,7,5],'X'=>[5,5,2,5,5],
+    'Y'=>[5,5,2,2,2],'Z'=>[7,1,2,4,7],'0'=>[7,5,5,5,7],'1'=>[2,6,2,2,7],'2'=>[6,1,2,4,7],'3'=>[6,1,2,1,6],
+    '4'=>[5,5,7,1,1],'5'=>[7,4,6,1,6],'6'=>[3,4,6,5,2],'7'=>[7,1,2,2,2],'8'=>[2,5,2,5,2],'9'=>[2,5,3,1,6],
+    ':'=>[0,2,0,2,0],'-'=>[0,0,7,0,0],'.'=>[0,0,0,0,2],' '=>[0;5],_=>[7,1,2,0,2],
+} }
+fn draw_label(canvas:&mut sdl2::render::Canvas<sdl2::video::Window>,text:&str,x:i32,y:i32,scale:i32,color:Color) {
+    canvas.set_draw_color(color);let mut cursor=x;
+    for ch in text.chars(){let rows=glyph_rows(ch);for (row,bits) in rows.iter().enumerate(){for col in 0..3{if *bits&(1<<(2-col))!=0{let _=canvas.fill_rect(Rect::new(cursor+col*scale,y+row as i32*scale,scale as u32,scale as u32));}}}cursor+=4*scale;}
+}
+fn text_width(s: &str, scale: i32) -> i32 { s.chars().count() as i32 * 4 * scale - scale }
+fn draw_text(canvas: &mut Cv, s: &str, x: i32, y: i32, scale: i32, color: Color) {
+    let o = if scale >= 3 { 2 } else { 1 };
+    draw_label(canvas, s, x + o, y + o, scale, Color::RGBA(0, 0, 0, 150));
+    draw_label(canvas, s, x, y, scale, color);
+}
+fn draw_panel(canvas: &mut Cv, x: i32, y: i32, w: u32, h: u32, accent: Color) {
+    canvas.set_draw_color(Color::RGBA(0, 0, 0, 70));
+    let _ = canvas.fill_rect(Rect::new(x + 3, y + 4, w, h));
+    canvas.set_draw_color(Color::RGBA(12, 18, 24, 215));
+    let _ = canvas.fill_rect(Rect::new(x, y, w, h));
+    canvas.set_draw_color(Color::RGBA(255, 255, 255, 38));
+    let _ = canvas.draw_rect(Rect::new(x, y, w, h));
+    canvas.set_draw_color(accent);
+    let _ = canvas.fill_rect(Rect::new(x, y, w, 3));
+}
+fn draw_keycap(canvas: &mut Cv, label: &str, x: i32, y: i32) {
+    let w = (text_width(label, 2) + 10) as u32;
+    canvas.set_draw_color(Color::RGB(6, 10, 14));
+    let _ = canvas.fill_rect(Rect::new(x, y + 2, w, 18));
+    canvas.set_draw_color(Color::RGB(66, 82, 90));
+    let _ = canvas.fill_rect(Rect::new(x, y, w, 18));
+    canvas.set_draw_color(Color::RGB(112, 132, 140));
+    let _ = canvas.fill_rect(Rect::new(x, y, w, 1));
+    draw_label(canvas, label, x + 5, y + 4, 2, Color::RGB(235, 245, 243));
+}
+fn draw_toggle(canvas: &mut Cv, x: i32, y: i32, on: bool) {
+    canvas.set_draw_color(if on { Color::RGB(73, 202, 190) } else { Color::RGB(66, 78, 84) });
+    let _ = canvas.fill_rect(Rect::new(x, y, 40, 18));
+    canvas.set_draw_color(Color::RGB(240, 248, 246));
+    let _ = canvas.fill_rect(Rect::new(x + if on { 24 } else { 2 }, y + 2, 14, 14));
+}
+fn draw_hud(canvas: &mut Cv, passed: u64, active: usize, close_calls: u64, auto: bool) {
+    let ink = Color::RGB(235, 245, 243);
+    let dim = Color::RGB(139, 164, 166);
+    let teal = Color::RGB(73, 202, 190);
+    let amber = Color::RGB(245, 185, 87);
+    let coral = Color::RGB(235, 145, 132);
+
+    // title
+    draw_panel(canvas, 16, 16, 250, 70, teal);
+    draw_text(canvas, "SMART ROAD", 30, 28, 3, ink);
+    draw_text(canvas, "AUTONOMOUS INTERSECTION", 30, 60, 2, dim);
+    fill_circle(canvas, 246, 36, 5, if auto { teal } else { Color::RGB(90, 104, 110) });
+
+    // live counters
+    draw_panel(canvas, 500, 16, 284, 92, amber);
+    draw_text(canvas, "PASSED", 516, 30, 2, dim);
+    draw_text(canvas, &format!("{}", passed), 516, 56, 4, amber);
+    draw_text(canvas, "ACTIVE", 604, 30, 2, dim);
+    draw_text(canvas, &format!("{}", active), 604, 56, 4, ink);
+    draw_text(canvas, "CLOSE", 692, 30, 2, dim);
+    draw_text(canvas, &format!("{}", close_calls), 692, 56, 4, coral);
+    canvas.set_draw_color(Color::RGBA(255, 255, 255, 28));
+    let _ = canvas.draw_line((596, 34), (596, 96));
+    let _ = canvas.draw_line((684, 34), (684, 96));
+
+    // controls
+    draw_panel(canvas, 16, 700, 232, 84, teal);
+    let rows = [("ARROWS", "ADD CAR"), ("R", "AUTO TRAFFIC"), ("ESC", "FINAL REPORT")];
+    for (i, (key, what)) in rows.iter().enumerate() {
+        let y = 712 + i as i32 * 22;
+        draw_keycap(canvas, key, 30, y);
+        draw_text(canvas, what, 100, y + 4, 2, ink);
+    }
+
+    // auto-traffic status
+    draw_panel(canvas, 584, 720, 200, 64, if auto { teal } else { Color::RGB(90, 104, 110) });
+    draw_text(canvas, "AUTO TRAFFIC", 598, 732, 2, dim);
+    draw_toggle(canvas, 598, 754, auto);
+    draw_text(canvas, if auto { "ON" } else { "OFF" }, 648, 758, 2, if auto { teal } else { dim });
 }
 fn add_vehicle(cars:&mut Vec<Vehicle>, next:&mut u64, from:Approach, rng:&mut SimpleRng) {
     let turn=[Turn::Left,Turn::Straight,Turn::Right][rng.range(3) as usize];
     let (dx,dy)=from.heading(); let occupied=cars.iter().filter(|c| c.from==from && c.turn==turn && c.phase==Phase::Queue).map(|c|c.p).fold(-1.,f32::max);
     let p=if occupied<0. {0.} else { (occupied- SAFETY-CAR_LEN).max(-120.) };
-    let hue=[Color::RGB(42,178,220),Color::RGB(244,172,55),Color::RGB(131,212,117),Color::RGB(210,111,220)][rng.range(4) as usize];
+    let hue=[Color::RGB(38,166,154),Color::RGB(245,166,35),Color::RGB(235,96,86),Color::RGB(140,110,230),Color::RGB(66,153,225),Color::RGB(150,205,85)][rng.range(6) as usize];
     let _=(dx,dy); cars.push(Vehicle{id:*next,from,turn,p,speed:0.,phase:Phase::Queue,elapsed:0.,color:hue}); *next+=1;
 }
 fn main() -> Result<(),String> {
     let sdl=sdl2::init()?; let video=sdl.video()?;
     let window=video.window("Smart Road — arrows: add cars | R: auto traffic | Esc: statistics",800,800).position_centered().build().map_err(|e|e.to_string())?;
     let mut canvas=window.into_canvas().present_vsync().build().map_err(|e|e.to_string())?;
+    canvas.set_blend_mode(sdl2::render::BlendMode::Blend);
     let mut events=sdl.event_pump()?; let mut cars:Vec<Vehicle>=Vec::new(); let mut rng=SimpleRng(0x534d415254524f41);
     let mut next=1; let mut stats=Stats{min_speed:f32::INFINITY,min_time:f32::INFINITY,..Stats::default()}; let mut running=true; let mut show_stats=false; let mut counted_close_pairs=HashSet::new();
     let mut last=Instant::now(); let mut spawn_clock=0.; let mut auto=false;
@@ -103,12 +441,11 @@ fn main() -> Result<(),String> {
         for id in done { if let Some(i)=cars.iter().position(|v|v.id==id) { let v=cars.remove(i);stats.record_pass(v.elapsed); } }
         // Detect dangerously close pairs (used as a visible metric as well as a safety check).
         for i in 0..cars.len(){for j in i+1..cars.len(){let pair=(cars[i].id.min(cars[j].id),cars[i].id.max(cars[j].id));if dist(position(&cars[i]),position(&cars[j]))<CAR_LEN+SAFETY && counted_close_pairs.insert(pair){stats.close_calls+=1;}}}
-        canvas.set_draw_color(Color::RGB(40,45,48));canvas.clear(); canvas.set_draw_color(Color::RGB(66,72,75));let _=canvas.fill_rect(Rect::new(300,0,200,800));let _=canvas.fill_rect(Rect::new(0,300,800,200));
-        canvas.set_draw_color(Color::RGB(220,205,140));
-        for y in (0..300).step_by(45).chain((500..800).step_by(45)) { for x in [330,360,390,410,440,470] { let _=canvas.draw_line((x,y),(x,y+22)); } }
-        for x in (0..300).step_by(45).chain((500..800).step_by(45)) { for y in [330,360,390,410,440,470] { let _=canvas.draw_line((x,y),(x+22,y)); } }
-        for i in 0..10 {let p=i*80;let _=canvas.fill_rect(Rect::new(395,p,3,36));let _=canvas.fill_rect(Rect::new(p,395,36,3));}
+        draw_scene(&mut canvas);
+        for v in &cars {draw_car_under(&mut canvas,v);}
         for v in &cars {draw_car(&mut canvas,v);}
+        draw_vignette(&mut canvas);
+        draw_hud(&mut canvas,stats.passed,cars.len(),stats.close_calls,auto);
         canvas.present();std::thread::sleep(Duration::from_millis(8));
     }
     if show_stats { let report=format!("Vehicles passed: {}\nFastest speed: {:.1} px/s\nSlowest speed: {:.1} px/s\nLongest time: {:.2} s\nShortest time: {:.2} s\nClose calls: {}",stats.passed,stats.max_speed,if stats.min_speed.is_finite(){stats.min_speed}else{0.},stats.max_time,if stats.min_time.is_finite(){stats.min_time}else{0.},stats.close_calls); sdl2::messagebox::show_simple_message_box(MessageBoxFlag::INFORMATION,"Smart Road — statistics",&report,None).map_err(|e|e.to_string())?; }
